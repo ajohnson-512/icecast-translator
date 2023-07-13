@@ -30,12 +30,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+const version = "1.0.3" // Update with your desired version number
+
 // We're pulling some stats out of the Icy/Adswizz XML.
 type Source struct {
 	MountPoint     string `xml:"mount,attr"`
 	Listeners      int    `xml:"listeners"`
 	TotalBytesSent int64  `xml:"total_bytes_sent"`
-	TotalByestRecv int64  `xml:"total_bytes_read"`
+	TotalBytesRecv int64  `xml:"total_bytes_read"`
 }
 
 // This XML structure.
@@ -67,7 +69,6 @@ func NewCustomCollector() *CustomCollector {
 			Name: "mountpoint_recv",
 			Help: "Data receive per mount point",
 		}, []string{"mountpoint"}),
-		// We don't care about your certs. This function is the Honey Badger of Security...
 		client: &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{
@@ -97,27 +98,9 @@ func (c *CustomCollector) Collect(ch chan<- prometheus.Metric) {
 // the URL structure. Then our function displays those stats on a dedicated /metrics page
 // for each call.
 // Error handling included for those who need it.
-func (c *CustomCollector) updateMetrics(r *http.Request, instance, target string) error {
-	parts := strings.Split(instance, ";")
-	if len(parts) != 3 && len(parts) != 4 {
-		return fmt.Errorf("invalid instance format, expected 'scheme;domain;port;uri' or 'domain;port;uri'")
-	}
-
-	var scheme, targets, port string
-	if len(parts) == 4 {
-		scheme = parts[0]
-		targets = parts[1]
-		port = parts[2]
-	} else {
-		scheme = "http"
-		targets = parts[0]
-		port = parts[1]
-	}
-
-	uri := parts[len(parts)-1]
-
+func (c *CustomCollector) updateMetrics(r *http.Request, scheme, domain, port, uri, target string) error {
 	auth := r.Header.Get("Authorization")
-	authParts := strings.Split(auth, " ")
+	authParts := strings.SplitN(auth, " ", 2)
 	if len(authParts) != 2 || authParts[0] != "Basic" {
 		return fmt.Errorf("invalid or missing Authorization header")
 	}
@@ -135,11 +118,11 @@ func (c *CustomCollector) updateMetrics(r *http.Request, instance, target string
 	username := url.QueryEscape(string(creds[0]))
 	password := url.QueryEscape(string(creds[1]))
 
-	url := fmt.Sprintf("%s://%s:%s@%s:%s%s", scheme, username, password, targets, port, uri)
+	url := fmt.Sprintf("%s://%s:%s@%s:%s%s", scheme, username, password, domain, port, uri)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return fmt.Errorf("error creating HTTP request for target %s: %v", target, err)
+		return fmt.Errorf("error creating HTTP request: %v", err)
 	}
 
 	resp, err := c.client.Do(req)
@@ -154,7 +137,7 @@ func (c *CustomCollector) updateMetrics(r *http.Request, instance, target string
 	err = decoder.Decode(&stats)
 	if err != nil {
 		if err == io.EOF {
-			return fmt.Errorf("error parsing Icecast stats XML for domain %s: %v", targets, err)
+			return fmt.Errorf("error parsing Icecast stats XML for domain %s: %v", domain, err)
 		}
 		return fmt.Errorf("error parsing Icecast stats XML: %v", err)
 	}
@@ -167,7 +150,7 @@ func (c *CustomCollector) updateMetrics(r *http.Request, instance, target string
 		mountpoint := source.MountPoint
 		c.listenersMetric.WithLabelValues(mountpoint).Set(float64(source.Listeners))
 		c.transmitMetric.WithLabelValues(mountpoint).Set(float64(source.TotalBytesSent))
-		c.recvMetric.WithLabelValues(mountpoint).Set(float64(source.TotalByestRecv))
+		c.recvMetric.WithLabelValues(mountpoint).Set(float64(source.TotalBytesRecv))
 	}
 
 	return nil
@@ -175,14 +158,29 @@ func (c *CustomCollector) updateMetrics(r *http.Request, instance, target string
 
 // Dis the main man.
 func main() {
+
+	log.Printf("Starting Icecast XML Translator v%s\n", version)
+
 	log.SetOutput(os.Stdout)
+	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
 
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		targets := r.URL.Query()["target"] // This gets a slice of targets from the query parameters
-		if len(targets) == 0 {
-			http.Error(w, "No targets specified", http.StatusBadRequest)
+		queryParams := r.URL.Query()
+		domain := queryParams.Get("domain")
+		target := queryParams.Get("target")
+
+		if target == "" && domain == "" {
+			http.Error(w, "No target/domain specified", http.StatusBadRequest)
 			return
 		}
+
+		domain = domain + target
+		port := queryParams.Get("port")
+		uri := queryParams.Get("uri")
+		scheme := queryParams.Get("scheme")
 
 		customRegistry := prometheus.NewRegistry()
 		customCollector := NewCustomCollector()
@@ -192,22 +190,28 @@ func main() {
 		var once sync.Once
 		var scrapeError error
 
-		for _, target := range targets {
-			wg.Add(1)
-			go func(target string) {
-				defer wg.Done()
-				if err := customCollector.updateMetrics(r, target, target); err != nil {
-					once.Do(func() {
-						scrapeError = err
-					})
+		target = fmt.Sprintf("%s;%s;%s", scheme, domain, port)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := customCollector.updateMetrics(r, scheme, domain, port, uri, target); err != nil {
+				// Check if the error is related to parsing the URL.
+				if urlErr, ok := err.(*url.Error); ok {
+					if strings.Contains(urlErr.Error(), "missing protocol scheme") {
+						err = fmt.Errorf("error creating HTTP request: missing protocol scheme")
+					}
 				}
-			}(target)
-		}
+				once.Do(func() {
+					scrapeError = err
+				})
+			}
+		}()
 
 		wg.Wait()
 
 		if scrapeError != nil {
-			log.Println(scrapeError)
+			log.Printf("Scrape error: %v\n", scrapeError)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -216,6 +220,6 @@ func main() {
 		handler.ServeHTTP(w, r)
 	})
 
-	log.Println("Starting server on :8085")
+	log.Println("Server started on :8085")
 	http.ListenAndServe(":8085", nil)
 }
