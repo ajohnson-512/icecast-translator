@@ -1,3 +1,0 @@
-cd /root/go/cmd/icecast-translator
-docker build --tag ajohnson512/icecast-translator:latest .
-docker push ajohnson512/icecast-translator:latest
